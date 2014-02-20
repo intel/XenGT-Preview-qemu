@@ -24,19 +24,37 @@ index d581d8d..e2506ca 100644
  
  common-obj-$(CONFIG_RC4030) += rc4030.o
  common-obj-$(CONFIG_DP8393X) += dp8393x.o
+diff --git a/hw/i386/Makefile.objs b/hw/i386/Makefile.objs
+index 0d3f6a8..d890e7d 100644
+--- a/hw/i386/Makefile.objs
++++ b/hw/i386/Makefile.objs
+@@ -9,7 +9,7 @@ obj-y += pc_sysfw.o
+ obj-y += lpc_ich9.o q35.o pc_q35.o
+ obj-$(CONFIG_XEN) += xen_platform.o xen_apic.o
+ obj-$(CONFIG_XEN_PCI_PASSTHROUGH) += xen-host-pci-device.o
+-obj-$(CONFIG_XEN_PCI_PASSTHROUGH) += xen_pt.o xen_pt_config_init.o xen_pt_msi.o
++obj-$(CONFIG_XEN_PCI_PASSTHROUGH) += xen_pt.o xen_pt_config_init.o xen_pt_msi.o xen_pt_igd.o
+ obj-y += kvm/
+ obj-$(CONFIG_SPICE) += qxl.o qxl-logger.o qxl-render.o
+ 
 diff --git a/hw/pc_piix.c b/hw/pc_piix.c
-index aa3e7f4..a9fed72 100644
+index aa3e7f4..904c82c 100644
 --- a/hw/pc_piix.c
 +++ b/hw/pc_piix.c
-@@ -46,6 +46,7 @@
+@@ -46,8 +46,11 @@
  #include "cpu.h"
  #ifdef CONFIG_XEN
  #  include <xen/hvm/hvm_info_table.h>
 +#  include "vga-xengt.h"
++#endif
++#ifdef CONFIG_XEN_PCI_PASSTHROUGH
++#include "xen_pt.h"
  #endif
- 
+-
  #define MAX_IDE_BUS 2
-@@ -92,9 +93,9 @@ static void pc_init1(MemoryRegion *system_memory,
+ 
+ static const int ide_iobase[MAX_IDE_BUS] = { 0x1f0, 0x170 };
+@@ -92,9 +95,9 @@ static void pc_init1(MemoryRegion *system_memory,
          kvmclock_create();
      }
  
@@ -49,7 +67,7 @@ index aa3e7f4..a9fed72 100644
      } else {
          above_4g_mem_size = 0;
          below_4g_mem_size = ram_size;
-@@ -162,7 +163,20 @@ static void pc_init1(MemoryRegion *system_memory,
+@@ -162,7 +165,32 @@ static void pc_init1(MemoryRegion *system_memory,
  
      pc_register_ferr_irq(gsi[13]);
  
@@ -64,6 +82,18 @@ index aa3e7f4..a9fed72 100644
 +    if (xengt_vga_enabled && pci_enabled) {
 +        xengt_vga_init(pci_bus);
 +        isa_create_simple(isa_bus, "isa-vga");
++    } else if (gfx_passthru) {
++        /*
++         * Do not create emulated VGA card here.
++         * and wait QEMU create qdev: xen-pci-passthrough,
++         * which is a pass-throughed IGD device.
++         * 
++         * We need a dummy graphic console here.
++         * otherwise QEMU will not have a vaild console,
++         * and we have to passthrough mouse and keyboard
++         * to control VM.
++         */
++        graphic_console_init(NULL, NULL, NULL, NULL, NULL);
 +    } else {
 +        pc_vga_init(isa_bus, pci_enabled ? pci_bus : NULL);
 +    }
@@ -72,22 +102,30 @@ index aa3e7f4..a9fed72 100644
          pci_create_simple(pci_bus, -1, "xen-platform");
      }
 diff --git a/hw/pci.c b/hw/pci.c
-index 97a0cd7..1cd4920 100644
+index 97a0cd7..3c9e1a6 100644
 --- a/hw/pci.c
 +++ b/hw/pci.c
-@@ -768,6 +768,11 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
+@@ -34,6 +34,7 @@
+ #include "msi.h"
+ #include "msix.h"
+ #include "exec-memory.h"
++#include "xen_pt.h"
+ 
+ //#define DEBUG_PCI
+ #ifdef DEBUG_PCI
+@@ -768,6 +769,11 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
      if (devfn < 0) {
          for(devfn = bus->devfn_min ; devfn < ARRAY_SIZE(bus->devices);
              devfn += PCI_FUNC_MAX) {
 +
 +            /* If vGT/XenGT is in use, reserve 00:02.* for the IGD */
-+            if (xengt_vga_enabled && devfn == 0x10)
++            if ((xengt_vga_enabled || gfx_passthru) && devfn == 0x10)
 +                continue; 
 +
              if (!bus->devices[devfn])
                  goto found;
          }
-@@ -799,6 +804,7 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
+@@ -799,6 +805,7 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
      pci_dev->irq_state = 0;
      pci_config_alloc(pci_dev);
  
@@ -95,23 +133,38 @@ index 97a0cd7..1cd4920 100644
      pci_config_set_vendor_id(pci_dev->config, pc->vendor_id);
      pci_config_set_device_id(pci_dev->config, pc->device_id);
      pci_config_set_revision(pci_dev->config, pc->revision);
+diff --git a/hw/pci.h b/hw/pci.h
+index 4da0c2a..d32a58f 100644
+--- a/hw/pci.h
++++ b/hw/pci.h
+@@ -102,6 +102,8 @@ typedef struct PCIIORegion {
+ 
+ #include "pci_regs.h"
+ 
++#define PCI_INTEL_OPREGION 0xfc
++
+ /* PCI HEADER_TYPE */
+ #define  PCI_HEADER_TYPE_MULTI_FUNCTION 0x80
+ 
 diff --git a/hw/piix_pci.c b/hw/piix_pci.c
-index ba1b3de..169b843 100644
+index ba1b3de..27f7c56 100644
 --- a/hw/piix_pci.c
 +++ b/hw/piix_pci.c
-@@ -31,7 +31,10 @@
+@@ -31,6 +31,13 @@
  #include "range.h"
  #include "xen.h"
  #include "pam.h"
--
 +#include "sysemu.h"
 +#ifdef CONFIG_XEN
 +#include "vga-xengt.h"
 +#endif
++#ifdef CONFIG_XEN_PCI_PASSTHROUGH
++#include "xen_pt.h"
++#endif
+ 
  /*
   * I440FX chipset data sheet.
-  * http://download.intel.com/design/chipsets/datashts/29054901.pdf
-@@ -136,6 +139,8 @@ static void i440fx_write_config(PCIDevice *dev,
+@@ -136,6 +143,8 @@ static void i440fx_write_config(PCIDevice *dev,
          range_covers_byte(address, len, I440FX_SMRAM)) {
          i440fx_update_memory_mappings(d);
      }
@@ -120,7 +173,7 @@ index ba1b3de..169b843 100644
  }
  
  static int i440fx_load_old(QEMUFile* f, void *opaque, int version_id)
-@@ -204,6 +209,11 @@ static int i440fx_initfn(PCIDevice *dev)
+@@ -204,6 +213,11 @@ static int i440fx_initfn(PCIDevice *dev)
      d->dev.config[I440FX_SMRAM] = 0x02;
  
      cpu_smm_register(&i440fx_set_smm, d);
@@ -132,7 +185,22 @@ index ba1b3de..169b843 100644
      return 0;
  }
  
-@@ -547,6 +557,10 @@ static void i440fx_class_init(ObjectClass *klass, void *data)
+@@ -296,6 +310,14 @@ static PCIBus *i440fx_common_init(const char *device_name,
+ 
+     i440fx_update_memory_mappings(f);
+ 
++#if CONFIG_XEN_PCI_PASSTHROUGH
++    if (gfx_passthru) {
++        d->config_read = igd_pci_read;
++        d->config_write = igd_pci_write;
++        intel_pch_init(b);
++    }
++#endif
++
+     return b;
+ }
+ 
+@@ -547,6 +569,10 @@ static void i440fx_class_init(ObjectClass *klass, void *data)
      dc->desc = "Host bridge";
      dc->no_user = 1;
      dc->vmsd = &vmstate_i440fx;
@@ -145,10 +213,10 @@ index ba1b3de..169b843 100644
  static const TypeInfo i440fx_info = {
 diff --git a/hw/vga-xengt.c b/hw/vga-xengt.c
 new file mode 100644
-index 0000000..6171044
+index 0000000..bb9b8e8
 --- /dev/null
 +++ b/hw/vga-xengt.c
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,353 @@
 +/*
 + * QEMU vGT/XenGT Legacy VGA support
 + *
@@ -452,6 +520,7 @@ index 0000000..6171044
 +    pci_config_set_vendor_id(dev->config, host_dev.vendor_id);
 +    pci_config_set_device_id(dev->config, host_dev.device_id);
 +    pci_config_set_revision(dev->config, host_dev.revision_id);
++    pci_config_set_class(dev->config, host_dev.class_code);
 +    br = DO_UPCAST(PCIBridge, dev, dev);
 +    pci_bridge_map_irq(br, "IGD Bridge",
 +                       pch_map_irq);
@@ -515,11 +584,43 @@ index 0000000..6215ede
 +void vgt_bridge_pci_write(PCIDevice *dev, uint32_t addr, uint32_t val, int len);
 +uint32_t vgt_bridge_pci_read(PCIDevice *pci_dev, uint32_t config_addr, int len);
 +#endif
+diff --git a/hw/vga.c b/hw/vga.c
+index 2b0200a..202cd44 100644
+--- a/hw/vga.c
++++ b/hw/vga.c
+@@ -618,7 +618,14 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
+     } else if (s->vbe_index == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
+         val = s->vram_size / (64 * 1024);
+     } else {
+-        val = 0;
++        switch (s->vbe_index) {
++            case VBE_DISPI_INDEX_LFB_ADDRESS_H:
++                val = VBE_DISPI_LFB_PHYSICAL_ADDRESS >> 16;
++                break;
++            default:
++                val = 0;
++                break;
++        }
+     }
+ #ifdef DEBUG_BOCHS_VBE
+     printf("VBE: read index=0x%x val=0x%x\n", s->vbe_index, val);
+diff --git a/hw/vga_int.h b/hw/vga_int.h
+index bcb738d..03d7741 100644
+--- a/hw/vga_int.h
++++ b/hw/vga_int.h
+@@ -45,6 +45,7 @@
+ #define VBE_DISPI_INDEX_Y_OFFSET        0x9
+ #define VBE_DISPI_INDEX_NB              0xa /* size of vbe_regs[] */
+ #define VBE_DISPI_INDEX_VIDEO_MEMORY_64K 0xa /* read-only, not in vbe_regs */
++#define VBE_DISPI_INDEX_LFB_ADDRESS_H    0xb
+ 
+ #define VBE_DISPI_ID0                   0xB0C0
+ #define VBE_DISPI_ID1                   0xB0C1
 diff --git a/hw/xen-host-pci-device.c b/hw/xen-host-pci-device.c
-index 743b37b..4171dc2 100644
+index 743b37b..16ed13e 100644
 --- a/hw/xen-host-pci-device.c
 +++ b/hw/xen-host-pci-device.c
-@@ -378,6 +378,11 @@ int xen_host_pci_device_get(XenHostPCIDevice *d, uint16_t domain,
+@@ -378,6 +378,16 @@ int xen_host_pci_device_get(XenHostPCIDevice *d, uint16_t domain,
      d->irq = v;
      d->is_virtfn = xen_host_pci_dev_is_virtfn(d);
  
@@ -528,35 +629,608 @@ index 743b37b..4171dc2 100644
 +        goto error;
 +    }
 +
++    rc = xen_host_pci_get_word(d, 0x0a, &d->class_code);
++    if (rc) {
++        goto error;
++    }
++
      return 0;
  error:
      if (d->config_fd >= 0) {
 diff --git a/hw/xen-host-pci-device.h b/hw/xen-host-pci-device.h
-index 0079dac..6bb6c9e 100644
+index 0079dac..ee25706 100644
 --- a/hw/xen-host-pci-device.h
 +++ b/hw/xen-host-pci-device.h
-@@ -25,6 +25,7 @@ typedef struct XenHostPCIDevice {
+@@ -25,6 +25,8 @@ typedef struct XenHostPCIDevice {
  
      uint16_t vendor_id;
      uint16_t device_id;
-+    uint16_t revision_id;
++    uint8_t revision_id;
++    uint16_t class_code;
      int irq;
  
      XenHostPCIIORegion io_regions[PCI_NUM_REGIONS - 1];
+diff --git a/hw/xen_pt.c b/hw/xen_pt.c
+index 7a3846e..223af3c 100644
+--- a/hw/xen_pt.c
++++ b/hw/xen_pt.c
+@@ -450,6 +450,21 @@ static int xen_pt_register_regions(XenPCIPassthroughState *s)
+                    d->rom.size, d->rom.base_addr);
+     }
+ 
++    if (gfx_passthru) {
++        /*
++         * Do not use vendor and class from PCIDevice,
++         * since no one populates them at this time.
++         */
++        uint16_t vendor = pci_get_word(s->dev.config + PCI_VENDOR_ID);
++        uint16_t class = pci_get_word(s->dev.config + PCI_CLASS_DEVICE);
++
++        /* Legacy VGA passthrough. */
++        if (vendor == PCI_VENDOR_ID_INTEL && class == PCI_CLASS_DISPLAY_VGA) {
++            register_vga_regions(&s->dev);
++            setup_vga_pt(&s->dev);
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -470,6 +485,14 @@ static void xen_pt_unregister_regions(XenPCIPassthroughState *s)
+     if (d->rom.base_addr && d->rom.size) {
+         memory_region_destroy(&s->rom);
+     }
++
++    if (gfx_passthru) {
++        uint16_t vendor = pci_get_word(s->dev.config + PCI_VENDOR_ID);
++        uint16_t class = pci_get_word(s->dev.config + PCI_CLASS_DEVICE);
++
++        if (vendor == PCI_VENDOR_ID_INTEL && class == PCI_CLASS_DISPLAY_VGA)
++            unregister_vga_regions(&s->dev);
++    }
+ }
+ 
+ /* region mapping */
+diff --git a/hw/xen_pt.h b/hw/xen_pt.h
+index f15e69a..aaa0d6b 100644
+--- a/hw/xen_pt.h
++++ b/hw/xen_pt.h
+@@ -298,5 +298,22 @@ static inline bool xen_pt_has_msix_mapping(XenPCIPassthroughState *s, int bar)
+     return s->msix && s->msix->bar_index == bar;
+ }
+ 
++extern int gfx_passthru;
++
++uint32_t igd_read_opregion(struct XenHostPCIDevice *dev);
++
++void igd_write_opregion(struct XenHostPCIDevice *dev, uint32_t val);
++
++uint32_t igd_pci_read(PCIDevice *pci_dev, uint32_t config_addr, int len);
++
++void igd_pci_write(PCIDevice *pci_dev, uint32_t config_addr, uint32_t val, int len);
++
++void intel_pch_init(PCIBus *bus);
++
++int setup_vga_pt(struct PCIDevice *dev);
++
++int register_vga_regions(struct PCIDevice *dev);
++
++int unregister_vga_regions(struct PCIDevice *dev);
+ 
+ #endif /* !XEN_PT_H */
+diff --git a/hw/xen_pt_config_init.c b/hw/xen_pt_config_init.c
+index 0a5f82c..dca7136 100644
+--- a/hw/xen_pt_config_init.c
++++ b/hw/xen_pt_config_init.c
+@@ -1438,6 +1438,37 @@ static XenPTRegInfo xen_pt_emu_reg_msix[] = {
+     },
+ };
+ 
++static int xen_pt_intel_opregion_read(XenPCIPassthroughState *s,
++		XenPTReg *cfg_entry,
++		uint32_t *value, uint32_t valid_mask)
++{
++	*value = igd_read_opregion(&s->real_device);
++	return 0;
++}
++
++static int xen_pt_intel_opregion_write(XenPCIPassthroughState *s,
++		XenPTReg *cfg_entry,
++		uint32_t *value, uint32_t dev_value,
++		uint32_t valid_mask)
++{
++	igd_write_opregion(&s->real_device, *value);
++	return 0;
++}
++
++static XenPTRegInfo xen_pt_emu_reg_igd_opregion[] = {
++    /* Intel IGFX OpRegion reg */
++    {
++        .offset     = 0x0,
++        .size       = 4,
++        .init_val   = 0,
++        .no_wb      = 1,
++        .u.dw.read   = xen_pt_intel_opregion_read,
++        .u.dw.write  = xen_pt_intel_opregion_write,
++    },
++    {
++        .size = 0,
++    },
++};
+ 
+ /****************************
+  * Capabilities
+@@ -1675,6 +1706,14 @@ static const XenPTRegGroupInfo xen_pt_emu_reg_grps[] = {
+         .size_init   = xen_pt_msix_size_init,
+         .emu_regs = xen_pt_emu_reg_msix,
+     },
++    /* Intel IGD Opregion group */
++    {
++        .grp_id      = PCI_INTEL_OPREGION,
++        .grp_type    = XEN_PT_GRP_TYPE_EMU,
++        .grp_size    = 0x4,
++        .size_init   = xen_pt_reg_grp_size_init,
++        .emu_regs = xen_pt_emu_reg_igd_opregion,
++    },
+     {
+         .grp_size = 0,
+     },
+@@ -1796,6 +1835,10 @@ static int xen_pt_config_reg_init(XenPCIPassthroughState *s,
+ 
+ int xen_pt_config_init(XenPCIPassthroughState *s)
+ {
++    uint16_t vendor = pci_get_word(s->dev.config + PCI_VENDOR_ID);
++    uint16_t class = pci_get_word(s->dev.config + PCI_CLASS_DEVICE);
++    int igd_device = !!(vendor == PCI_VENDOR_ID_INTEL && class == PCI_CLASS_DISPLAY_VGA);
++
+     int i, rc;
+ 
+     QLIST_INIT(&s->reg_grps);
+@@ -1803,8 +1846,15 @@ int xen_pt_config_init(XenPCIPassthroughState *s)
+     for (i = 0; xen_pt_emu_reg_grps[i].grp_size != 0; i++) {
+         uint32_t reg_grp_offset = 0;
+         XenPTRegGroup *reg_grp_entry = NULL;
++        /*
++         * Due to the limitation of XEN PT PCI configuration
++         * emulation routines: assuming the offset of special group
++         * 0xff is always 0. We have to open a new group and add
++         * a small workaround here for OPREGION emulation.
++         */
++        if (xen_pt_emu_reg_grps[i].grp_id != 0xFF
++                && xen_pt_emu_reg_grps[i].grp_id != PCI_INTEL_OPREGION) {
+ 
+-        if (xen_pt_emu_reg_grps[i].grp_id != 0xFF) {
+             if (xen_pt_hide_dev_cap(&s->real_device,
+                                     xen_pt_emu_reg_grps[i].grp_id)) {
+                 continue;
+@@ -1817,6 +1867,16 @@ int xen_pt_config_init(XenPCIPassthroughState *s)
+             }
+         }
+ 
++        if (xen_pt_emu_reg_grps[i].grp_id == PCI_INTEL_OPREGION) {
++            /*
++             * Do not emulate OPREGION on non-IGD device.
++             */
++            if (!igd_device)
++                continue;
++
++            reg_grp_offset = PCI_INTEL_OPREGION;
++        }
++
+         reg_grp_entry = g_new0(XenPTRegGroup, 1);
+         QLIST_INIT(&reg_grp_entry->reg_tbl_list);
+         QLIST_INSERT_HEAD(&s->reg_grps, reg_grp_entry, entries);
+diff --git a/hw/xen_pt_igd.c b/hw/xen_pt_igd.c
+new file mode 100644
+index 0000000..a453216
+--- /dev/null
++++ b/hw/xen_pt_igd.c
+@@ -0,0 +1,381 @@
++/*
++ * graphics passthrough
++ */
++#include "xen_pt.h"
++#include "xen-host-pci-device.h"
++#include "xen_backend.h"
++#include "pci_bridge.h"
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <assert.h>
++
++#define D(fmt, args...) \
++	fprintf(stderr, "D [ %lu ] %s() - %d: "fmt"\n", time(NULL), __func__, __LINE__, ##args)
++
++#define E(fmt, args...) \
++	fprintf(stderr, "E [ %lu ] %s() - %d: "fmt"\n", time(NULL), __func__, __LINE__, ##args)
++
++int gfx_passthru;
++
++static uint32_t igd_guest_opregion = 0;
++
++typedef struct {
++	PCIDevice dev;
++} ISABridgeState;
++
++static TypeInfo isa_bridge_info = {
++	.name          = "inte-pch-isa-bridge",
++	.parent        = TYPE_PCI_DEVICE,
++	.instance_size = sizeof(ISABridgeState),
++};
++
++static void xen_pt_graphics_register_types(void)
++{
++	type_register_static(&isa_bridge_info);
++}
++
++type_init(xen_pt_graphics_register_types)
++
++static int create_pch_isa_bridge(PCIBus *bus, XenHostPCIDevice *hdev)
++{
++	struct PCIDevice *dev;
++
++	char rid;
++
++	dev = pci_create(bus, PCI_DEVFN(0x1f, 0), "inte-pch-isa-bridge");
++	if (!dev) {
++		E("fail to create PCH ISA bridge.");
++		return -1;
++	}
++
++	qdev_init_nofail(&dev->qdev);
++
++	pci_config_set_vendor_id(dev->config, hdev->vendor_id);
++	pci_config_set_device_id(dev->config, hdev->device_id);
++
++	xen_host_pci_get_block(hdev, PCI_REVISION_ID, (uint8_t *)&rid, 1);
++
++	pci_config_set_revision(dev->config, rid);
++	pci_config_set_class(dev->config, PCI_CLASS_BRIDGE_ISA);
++
++	D("vid: 0x%x, did: 0x%x rid: 0x%x.", (unsigned int)hdev->vendor_id,
++			(unsigned int)hdev->device_id,
++			(unsigned int)rid);
++
++	return 0;
++}
++
++void intel_pch_init(PCIBus *bus)
++{
++	XenHostPCIDevice hdev;
++	int r;
++
++	D("Called.");
++
++	r = xen_host_pci_device_get(&hdev, 0, 0, 0x1f, 0);
++	if (r) {
++		E("fail to find intel PCH.");
++		goto err;
++	}
++
++	if (hdev.vendor_id == PCI_VENDOR_ID_INTEL) {
++		r = create_pch_isa_bridge(bus, &hdev);
++		if (r) {
++			E("fail to create PCH ISA bridge.");
++			goto err;
++		}
++	}
++
++	xen_host_pci_device_put(&hdev);
++
++	return;
++
++err:
++	E("fail to detect intel PCH.");
++	abort();
++
++	return;
++}
++
++uint32_t igd_read_opregion(struct XenHostPCIDevice *dev)
++{
++	uint32_t val = -1;
++
++	if ( igd_guest_opregion == 0 )
++		return -1;
++
++	val = igd_guest_opregion;
++
++	D("val: 0x%x.", val);
++
++	return val;
++}
++
++void igd_write_opregion(struct XenHostPCIDevice *dev, uint32_t val)
++{
++	uint32_t host_opregion = 0;
++	int ret;
++
++	D("Called.");
++
++	if (igd_guest_opregion) {
++		E("opregion register already been set, ignoring %x\n", val);
++		return;
++	}
++
++	xen_host_pci_get_block(dev, PCI_INTEL_OPREGION, (uint8_t *)&host_opregion, 4);
++	igd_guest_opregion = (val & ~0xfff) | (host_opregion & 0xfff);
++
++	D("Map OpRegion: %x -> %x", host_opregion, igd_guest_opregion);
++
++	ret = xc_domain_memory_mapping(xen_xc, xen_domid,
++			igd_guest_opregion >> XC_PAGE_SHIFT,
++			host_opregion >> XC_PAGE_SHIFT,
++			2,
++			DPCI_ADD_MAPPING);
++
++	if ( ret != 0 )
++	{
++		E("Can't map opregion");
++		igd_guest_opregion = 0;
++	}
++
++	return;
++}
++
++void igd_pci_write(PCIDevice *pci_dev, uint32_t config_addr, uint32_t val, int len)
++{
++	XenHostPCIDevice dev;
++	int r;
++
++	assert(pci_dev->devfn == 0x00);
++
++	D("B W %x %x %x", config_addr, val, len);
++
++	switch (config_addr)
++	{
++		case 0x58:        // PAVPC Offset
++			break;
++		default:
++			goto write_default;
++	}
++
++	/* Host write */
++	r = xen_host_pci_device_get(&dev, 0, 0, 0, 0);
++	if (r) {
++		E("Can't get pci_dev_host_bridge");
++		abort();
++	}
++
++	r = xen_host_pci_set_block(&dev, config_addr, (uint8_t *)&val, len);
++	if (r) {
++		E("Can't get pci_dev_host_bridge");
++		abort();
++	}
++
++	xen_host_pci_device_put(&dev);
++
++	D("addr=%x len=%x val=%x", config_addr, len, val);
++
++	return;
++
++write_default:
++	pci_default_write_config(pci_dev, config_addr, val, len);
++
++	return;
++}
++
++uint32_t igd_pci_read(PCIDevice *pci_dev, uint32_t config_addr, int len)
++{
++	XenHostPCIDevice dev;
++	uint32_t val;
++	int r;
++
++	D("B R %x %x", config_addr, len);
++
++	assert(pci_dev->devfn == 0x00);
++
++	switch (config_addr)
++	{
++		case 0x00:        /* vendor id */
++		case 0x02:        /* device id */
++		case 0x08:        /* revision id */
++		case 0x2c:        /* sybsystem vendor id */
++		case 0x2e:        /* sybsystem id */
++		case 0x50:        /* SNB: processor graphics control register */
++		case 0x52:        /* processor graphics control register */
++		case 0xa0:        /* top of memory */
++		case 0xb0:        /* ILK: BSM: should read from dev 2 offset 0x5c */
++		case 0x58:        /* SNB: PAVPC Offset */
++		case 0xa4:        /* SNB: graphics base of stolen memory */
++		case 0xa8:        /* SNB: base of GTT stolen memory */
++			break;
++		default:
++			goto read_default;
++	}
++
++	/* Host read */
++	r = xen_host_pci_device_get(&dev, 0, 0, 0, 0);
++	if (r) {
++		E("Can't get pci_dev_host_bridge");
++		abort();
++	}
++
++	r = xen_host_pci_get_block(&dev, config_addr, (uint8_t *)&val, len);
++	if (r) {
++		E("Can't get pci_dev_host_bridge");
++		abort();
++	}
++
++	xen_host_pci_device_put(&dev);
++
++	D("B TR %x %x %x", config_addr, val, len);
++
++	return val;
++
++read_default:
++
++	return pci_default_read_config(pci_dev, config_addr, len);
++}
++
++/*
++ * register VGA resources for the domain with assigned gfx
++ */
++int register_vga_regions(struct PCIDevice *dev)
++{
++	int ret = 0;
++
++	ret |= xc_domain_ioport_mapping(xen_xc, xen_domid, 0x3B0,
++			0x3B0, 0xA, DPCI_ADD_MAPPING);
++
++	ret |= xc_domain_ioport_mapping(xen_xc, xen_domid, 0x3C0,
++			0x3C0, 0x20, DPCI_ADD_MAPPING);
++
++	ret |= xc_domain_memory_mapping(xen_xc, xen_domid,
++			0xa0000 >> XC_PAGE_SHIFT,
++			0xa0000 >> XC_PAGE_SHIFT,
++			0x20,
++			DPCI_ADD_MAPPING);
++
++	if (ret != 0)
++		E("VGA region mapping failed");
++
++	return ret;
++}
++
++/*
++ * unregister VGA resources for the domain with assigned gfx
++ */
++int unregister_vga_regions(struct PCIDevice *dev)
++{
++	int ret = 0;
++
++	if ( !gfx_passthru || PCI_DEVICE_GET_CLASS(dev)->class_id != 0x0300 )
++		return ret;
++
++	ret |= xc_domain_ioport_mapping(xen_xc, xen_domid, 0x3B0,
++			0x3B0, 0xC, DPCI_REMOVE_MAPPING);
++
++	ret |= xc_domain_ioport_mapping(xen_xc, xen_domid, 0x3C0,
++			0x3C0, 0x20, DPCI_REMOVE_MAPPING);
++
++	ret |= xc_domain_memory_mapping(xen_xc, xen_domid,
++			0xa0000 >> XC_PAGE_SHIFT,
++			0xa0000 >> XC_PAGE_SHIFT,
++			20,
++			DPCI_REMOVE_MAPPING);
++
++	ret |= xc_domain_memory_mapping(xen_xc, xen_domid,
++			igd_guest_opregion >> XC_PAGE_SHIFT,
++			igd_guest_opregion >> XC_PAGE_SHIFT,
++			2,
++			DPCI_REMOVE_MAPPING);
++
++    if (ret != 0)
++        E("VGA region unmapping failed");
++
++	return ret;
++}
++
++static int get_vgabios(unsigned char *buf)
++{
++    int fd;
++    uint32_t bios_size = 0;
++    uint32_t start = 0xC0000;
++    uint16_t magic = 0;
++
++    if ((fd = open("/dev/mem", O_RDONLY)) < 0) {
++        E("Error: Can't open /dev/mem: %s", strerror(errno));
++        return 0;
++    }
++
++    /*
++     * Check if it a real bios extension.
++     * The magic number is 0xAA55.
++     */
++    if (start != lseek(fd, start, SEEK_SET))
++        goto out;
++    if (read(fd, &magic, 2) != 2)
++        goto out;
++    if (magic != 0xAA55)
++        goto out;
++
++    /* Find the size of the rom extension */
++    if (start != lseek(fd, start, SEEK_SET))
++        goto out;
++    if (lseek(fd, 2, SEEK_CUR) != (start + 2))
++        goto out;
++    if (read(fd, &bios_size, 1) != 1)
++        goto out;
++
++    /* This size is in 512 bytes */
++    bios_size *= 512;
++
++    /*
++     * Set the file to the begining of the rombios,
++     * to start the copy.
++     */
++    if (start != lseek(fd, start, SEEK_SET))
++        goto out;
++
++    if (bios_size != read(fd, buf, bios_size))
++        bios_size = 0;
++
++out:
++    close(fd);
++    return bios_size;
++}
++
++int setup_vga_pt(struct PCIDevice *dev)
++{
++	unsigned char *bios = NULL;
++	int bios_size = 0;
++	char *c = NULL;
++	char checksum = 0;
++	int rc = 0;
++
++	/* Allocated 64K for the vga bios */
++	if (!(bios = malloc(64 * 1024)))
++		return -1;
++
++	bios_size = get_vgabios(bios);
++	if (bios_size == 0 || bios_size > 64 * 1024) {
++		E("vga bios size (0x%x) is invalid!", bios_size);
++		rc = -1;
++		goto out;
++	}
++
++	/* Adjust the bios checksum */
++	for (c = (char*)bios; c < ((char*)bios + bios_size); c++)
++		checksum += *c;
++
++	if (checksum) {
++		bios[bios_size - 1] -= checksum;
++		D("vga bios checksum is adjusted!");
++	}
++
++	cpu_physical_memory_rw(0xc0000, bios, bios_size, 1);
++out:
++	free(bios);
++	return rc;
++}
 diff --git a/qemu-options.hx b/qemu-options.hx
-index de43b1b..f3ff518 100644
+index de43b1b..c967684 100644
 --- a/qemu-options.hx
 +++ b/qemu-options.hx
-@@ -1004,7 +1004,7 @@ Rotate graphical output some deg left (only PXA LCD).
+@@ -1003,8 +1003,17 @@ STEXI
+ Rotate graphical output some deg left (only PXA LCD).
  ETEXI
  
++DEF("gfx_passthru", 0, QEMU_OPTION_gfx_passthru,
++    "-gfx_passthru   enable Intel IGD passthrough by XEN\n",
++    QEMU_ARCH_ALL)
++STEXI
++@item -gfx_passthru
++@findex -gfx_passthru
++Enable Intel IGD passthrough by XEN
++ETEXI
++
  DEF("vga", HAS_ARG, QEMU_OPTION_vga,
 -    "-vga [std|cirrus|vmware|qxl|xenfb|none]\n"
 +    "-vga [std|cirrus|vmware|qxl|xenfb|xengt|none]\n"
      "                select video card type\n", QEMU_ARCH_ALL)
  STEXI
  @item -vga @var{type}
-@@ -1029,11 +1029,42 @@ card.
+@@ -1029,11 +1038,42 @@ card.
  QXL paravirtual graphic card.  It is VGA compatible (including VESA
  2.0 VBE support).  Works best with qxl guest drivers installed though.
  Recommended choice when using the spice protocol.
@@ -619,9 +1293,25 @@ index f5ac664..b10a9fc 100644
  extern int graphic_width;
  extern int graphic_height;
 diff --git a/vl.c b/vl.c
-index a3ab384..001291a 100644
+index a3ab384..9f24f58 100644
 --- a/vl.c
 +++ b/vl.c
+@@ -124,6 +124,7 @@ int main(int argc, char **argv)
+ #include "hw/watchdog.h"
+ #include "hw/smbios.h"
+ #include "hw/xen.h"
++#include "hw/xen_pt.h"
+ #include "hw/qdev.h"
+ #include "hw/loader.h"
+ #include "bt-host.h"
+@@ -153,7 +154,6 @@ int main(int argc, char **argv)
+ #include "fsdev/qemu-fsdev.h"
+ #endif
+ #include "qtest.h"
+-
+ #include "disas.h"
+ 
+ #include "qemu_socket.h"
 @@ -1848,6 +1848,8 @@ static void select_vgahw (const char *p)
              fprintf(stderr, "Error: standard VGA not available\n");
              exit(0);
@@ -631,10 +1321,13 @@ index a3ab384..001291a 100644
      } else if (strstart(p, "cirrus", &opts)) {
          if (cirrus_vga_available()) {
              vga_interface_type = VGA_CIRRUS;
-@@ -3520,6 +3522,26 @@ int main(int argc, char **argv, char **envp)
+@@ -3520,6 +3522,29 @@ int main(int argc, char **argv, char **envp)
              case QEMU_OPTION_object:
                  opts = qemu_opts_parse(qemu_find_opts("object"), optarg, 1);
                  break;
++            case QEMU_OPTION_gfx_passthru:
++                gfx_passthru = 1;
++                break;
 +            case QEMU_OPTION_vgt_low_gm_sz:
 +                {
 +                    extern int vgt_low_gm_sz;
@@ -658,3 +1351,15 @@ index a3ab384..001291a 100644
              default:
                  os_parse_cmd_args(popt->index, optarg);
              }
+@@ -3546,6 +3571,11 @@ int main(int argc, char **argv, char **envp)
+     }
+ #endif
+ 
++    if (xengt_vga_enabled && gfx_passthru) {
++        fprintf(stderr, "Cannot enable XENGT and VTD at the same time.\n");
++        exit(1);
++    }
++
+     if (machine == NULL) {
+         fprintf(stderr, "No machine found.\n");
+         exit(1);
