@@ -4,3 +4,5 @@ qemu-vgt.patch:
 		git checkout -b v1.3.0 v1.3.0
 		patch -p1 < qemu-vgt.patch
 
+
+Please see https://github.com/01org/XenGT-Preview-kernel for the latest setup guide.
